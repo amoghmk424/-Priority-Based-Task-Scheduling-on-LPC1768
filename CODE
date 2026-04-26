@@ -1,1 +1,188 @@
+#include "LPC17xx.h"
+#include <stdio.h>
+#include <stdint.h>
 
+/*------------------- System Tick -------------------*/
+volatile uint32_t msTicks = 0;
+void SysTick_Handler(void) { msTicks++; }
+static inline uint32_t get_tick(void) { return msTicks; }
+
+/*------------------- LCD Pins ----------------------*/
+#define LCD_D4_POS   20U
+#define LCD_D4_MASK  (0x0FUL << LCD_D4_POS)   /* P1.20..P1.23 */
+#define LCD_RS_PIN   (1UL << 25)              /* P3.25 */
+#define LCD_RW_PIN   (1UL << 26)              /* P3.26 */
+#define LCD_EN_PIN   (1UL << 28)              /* P4.28 */
+
+/*------------------- Motor / LED / Stepper ---------*/
+#define DC_IN1_PIN   (1UL << 19)   /* P0.19 */
+#define DC_IN2_PIN   (1UL << 20)   /* P0.20 */
+#define LED1_PIN     (1UL << 0)    /* P2.0 */
+
+/* Stepper pins P1.24..P1.27 */
+#define STEP_A_PIN   (1UL << 24)
+#define STEP_B_PIN   (1UL << 25)
+#define STEP_C_PIN   (1UL << 26)
+#define STEP_D_PIN   (1UL << 27)
+
+/*------------------- UART --------------------------*/
+void UART0_Init(uint32_t baud) {
+    uint32_t pclk = SystemCoreClock / 4;
+    uint16_t dll = (uint16_t)(pclk / (16 * baud));
+
+    LPC_SC->PCONP |= (1<<3);
+    LPC_PINCON->PINSEL0 |= (1<<4)|(1<<6);   // TXD0, RXD0
+    LPC_UART0->LCR = 0x83;
+    LPC_UART0->DLL = dll & 0xFF;
+    LPC_UART0->DLM = dll >> 8;
+    LPC_UART0->LCR = 0x03;
+}
+
+void UART0_SendChar(char c) {
+    while (!(LPC_UART0->LSR & (1<<5)));
+    LPC_UART0->THR = c;
+}
+void UART0_SendString(const char *s) {
+    while (*s) UART0_SendChar(*s++);
+}
+
+/*------------------- LCD ---------------------------*/
+void lcd_pulse(void) {
+    LPC_GPIO4->FIOSET = LCD_EN_PIN;
+    for (volatile int i=0;i<2000;i++);
+    LPC_GPIO4->FIOCLR = LCD_EN_PIN;
+}
+void lcd_send4(uint8_t n) {
+    LPC_GPIO1->FIOCLR = LCD_D4_MASK;
+    LPC_GPIO1->FIOSET = (n << LCD_D4_POS);
+}
+void LCD_Cmd(uint8_t c) {
+    LPC_GPIO3->FIOCLR = LCD_RS_PIN | LCD_RW_PIN;
+    lcd_send4(c>>4); lcd_pulse();
+    lcd_send4(c);    lcd_pulse();
+}
+void LCD_Data(uint8_t d) {
+    LPC_GPIO3->FIOSET = LCD_RS_PIN;
+    LPC_GPIO3->FIOCLR = LCD_RW_PIN;
+    lcd_send4(d>>4); lcd_pulse();
+    lcd_send4(d);    lcd_pulse();
+}
+void LCD_Init(void) {
+    LPC_GPIO1->FIODIR |= LCD_D4_MASK;
+    LPC_GPIO3->FIODIR |= LCD_RS_PIN | LCD_RW_PIN;
+    LPC_GPIO4->FIODIR |= LCD_EN_PIN;
+
+    for (volatile int i=0;i<30000;i++);
+    lcd_send4(0x03); lcd_pulse();
+    lcd_send4(0x02); lcd_pulse();
+    LCD_Cmd(0x28);
+    LCD_Cmd(0x0C);
+    LCD_Cmd(0x01);
+}
+void LCD_Clear(void) { LCD_Cmd(0x01); }
+void LCD_Print(const char *s) { while (*s) LCD_Data(*s++); }
+
+/*------------------- GPIO --------------------------*/
+void GPIO_Init(void) {
+    LPC_GPIO0->FIODIR |= DC_IN1_PIN | DC_IN2_PIN;
+    LPC_GPIO2->FIODIR |= LED1_PIN;
+    LPC_GPIO1->FIODIR |= STEP_A_PIN | STEP_B_PIN | STEP_C_PIN | STEP_D_PIN;
+}
+
+/*------------------- Tasks -------------------------*/
+void Task_LCD(void) {
+    static int c=0; static uint32_t t=0;
+    if (get_tick() - t > 300) {
+        t = get_tick();
+        LCD_Clear();
+        LCD_Print("LCD: ");
+        LCD_Data('0'+c);
+        c = (c+1)%10;
+    }
+}
+void Task_DC(void) {
+    LPC_GPIO0->FIOSET = DC_IN1_PIN;
+    LPC_GPIO0->FIOCLR = DC_IN2_PIN;
+}
+void Task_UART(void) {
+    static int v=11; static uint32_t t=0;
+    if (get_tick() - t > 1000) {
+        t = get_tick();
+        char b[32];
+        sprintf(b,"UART:%d\r\n",v++);
+        UART0_SendString(b);
+        if (v>50) v=11;
+    }
+}
+void Task_LED(void) {
+    static uint32_t t=0; static int s=0;
+    if (get_tick() - t > 500) {
+        t = get_tick();
+        s = !s;
+        if (s) LPC_GPIO2->FIOSET = LED1_PIN;
+        else   LPC_GPIO2->FIOCLR = LED1_PIN;
+    }
+}
+void Task_Step(void) {
+    static uint8_t s=0; static uint32_t t=0;
+    if (get_tick() - t > 20) {
+        t = get_tick();
+        LPC_GPIO1->FIOCLR = STEP_A_PIN|STEP_B_PIN|STEP_C_PIN|STEP_D_PIN;
+        if (s==0) LPC_GPIO1->FIOSET = STEP_A_PIN;
+        if (s==1) LPC_GPIO1->FIOSET = STEP_B_PIN;
+        if (s==2) LPC_GPIO1->FIOSET = STEP_C_PIN;
+        if (s==3) LPC_GPIO1->FIOSET = STEP_D_PIN;
+        s = (s+1)&3;
+    }
+}
+
+/*------------------- Priority Scheduler ------------*/
+enum { LCD=0, DC=1, UART=2, LED=3, STEP=4 };
+int priority[5] = {2,3,4,1,2};
+uint8_t schedule[5] = { UART, DC, LCD, STEP, LED };
+
+void PrintPriorities(void) {
+    char b[80];
+    UART0_SendString("\r\nPriority Round Robin\r\n");
+    sprintf(b,"LCD=%d  DC=%d  UART=%d  LED=%d  STEP=%d\r\n",
+            priority[LCD],priority[DC],priority[UART],priority[LED],priority[STEP]);
+    UART0_SendString(b);
+    UART0_SendString("Order: UART -> DC -> LCD -> STEP -> LED\r\n\r\n");
+}
+
+/*------------------- Main --------------------------*/
+#define SLICE 5000
+
+int main(void) {
+    SystemInit();
+    SystemCoreClockUpdate();
+    SysTick_Config(SystemCoreClock/1000);
+
+    GPIO_Init();
+    UART0_Init(9600);
+    LCD_Init();
+
+    PrintPriorities();
+
+    uint8_t idx = 0;
+    uint32_t last = get_tick();
+
+    while (1) {
+        switch (schedule[idx]) {
+            case LCD:  Task_LCD();  break;
+            case DC:   Task_DC();   break;
+            case UART: Task_UART(); break;
+            case LED:  Task_LED();  break;
+            case STEP: Task_Step(); break;
+        }
+
+        if (get_tick() - last > SLICE) {
+            LPC_GPIO0->FIOCLR = DC_IN1_PIN|DC_IN2_PIN;
+            LPC_GPIO2->FIOCLR = LED1_PIN;
+            LPC_GPIO1->FIOCLR = STEP_A_PIN|STEP_B_PIN|STEP_C_PIN|STEP_D_PIN;
+            LCD_Clear();
+            last = get_tick();
+            idx = (idx+1)%5;
+        }
+    }
+}
