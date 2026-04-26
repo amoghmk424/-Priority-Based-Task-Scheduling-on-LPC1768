@@ -42,6 +42,10 @@
 * Task_Step:
   * Drives stepper motor in sequence.
 
+ ##  Block Diagram
+![](media/blockdiagram.png)
+
+
 ## Scheduling Algorithm
 * Priority-Based Round Robin Scheduling
 
